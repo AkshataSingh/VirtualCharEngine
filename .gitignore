@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Downloaded/generated HF model folders
+qwen_hf/
+qwen_pruned/
+qwen_pruned_distilled/
+qwen_unstructured_pruned/
+qwen_vl_hf/
+qwen_vl_onnx/
+
+# llama.cpp (cloned external repo)
+llama.cpp/
+
+# Large model/binary artifacts
+*.gguf
+*.onnx
+*.exe
+*.dll
+
+# Test audio outputs
+*.wav
+
+# HF cache-related noise
+*.onnx.json
