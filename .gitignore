@@ -14,6 +14,7 @@ qwen_vl_onnx/
 # llama.cpp (cloned external repo)
 llama.cpp/
 
+
 # Large model/binary artifacts
 *.gguf
 *.onnx
@@ -25,3 +26,37 @@ llama.cpp/
 
 # HF cache-related noise
 *.onnx.json
+
+# Unity
+
+**/Library/
+**/Temp/
+**/Obj/
+**/Logs/
+**/UserSettings/
+**/MemoryCaptures/
+*.csproj
+*.sln
+
+# Unity template leftovers
+**/TutorialInfo/
+**/TutorialInfo.meta
+**/Readme.asset
+**/Readme.asset.meta
+**/_Recovery/
+**/_Recovery.meta
+**/TextMesh Pro/
+**/TextMesh Pro.meta
+
+
+# cpp_wrapper - downloaded libraries and build artifacts, not our own work
+cpp_wrapper/onnxruntime-win-x64-1.28.2/
+cpp_wrapper/*.exe
+cpp_wrapper/*.dll
+cpp_wrapper/*.onnx
+cpp_wrapper/*.gguf
+cpp_wrapper/tts_error.log
+cpp_wrapper/*.wav
+
+# Debug logs
+llm_error.log

@@ -158,3 +158,85 @@ Hello there! I'm Qwen, an AI language model designed to assist and provide infor
 | With caching (partial) | Final output still correct | 291-319 ms/token (~2.5x faster) | Known contained bug: draft re-feeds an already-cached token at the start of each round, corrupting some mid-generation proposals (doesn't affect final output correctness, does reduce efficiency in the affected round) |
 
 **Honest takeaway**: the core speculative decoding algorithm is proven correct and effective (56% acceptance, validated against exact-match ground truth). Caching gives a real, meaningful speedup (~2.5x) but this implementation has a known, diagnosed-but-unfixed edge case in cross-round cache bookkeeping — a legitimate scope boundary, not a hidden flaw.
+
+## Custom Triton Kernel — Fused RMSNorm
+
+| Implementation | Latency | Notes |
+|---|---|---|
+| PyTorch (unfused, multiple ops) | 0.0464 ms | Standard implementation, each step round-trips to GPU memory |
+| Triton (fused, single kernel) | 0.0147 ms | One read, one write — eliminates intermediate memory traffic |
+| **Speedup** | **3.15x** | Verified correct (matches PyTorch output within fp16 tolerance). Benchmarked at n_cols=896, the real hidden dimension of Qwen2.5-0.5B — this exact op runs in every transformer layer, every forward pass. |
+
+
+## Custom Triton Kernel — Fused INT8 Dequantize + Matmul
+
+| Implementation | Latency | Notes |
+|---|---|---|
+| Unfused (dequant to fp16, then cuBLAS matmul) | 0.0369 ms | Two passes: dequantize (write full fp16 weights), then matmul (read them back) |
+| Fused (Triton, INT8 read + dequant + matmul in one kernel) | 0.0205 ms | Dequantization happens inline in the matmul's inner loop — weights never materialized in fp16 |
+| **Speedup** | **1.79x** | Exact match to reference (0.0 difference). Benchmarked at K=N=896, matching Qwen2.5-0.5B's real hidden dimension. Beats PyTorch's cuBLAS-backed matmul — a genuinely hard bar to clear. |
+
+
+## C++ Inference Wrapper — Piper TTS via ONNX Runtime C++ API
+
+| Component | Status |
+|---|---|
+| Compiler | g++ (MinGW), not MSVC — confirmed compatible with ONNX Runtime's official Windows binaries |
+| Model loading | Working — loads en_US-lessac-medium.onnx via Ort::Session |
+| Multi-input tensor handling | Working — phoneme IDs (int64), lengths (int64), scales (float) correctly constructed and passed |
+| Inference | Working — 18,432 audio samples generated for "Hello there." |
+| Output | Real WAV file written directly from C++ (manual RIFF/WAVE header construction, no library dependency for audio output) |
+
+**Scope note**: text→phoneme conversion (Piper's phonemizer, which uses espeak-ng) stays in Python for this proof-of-concept — the C++ wrapper focuses specifically on the inference step, which is the part that would actually run inside a game engine's real-time loop. Full text-to-phoneme in C++ would be a separate, substantial addition (bundling or reimplementing espeak-ng).
+
+
+## Phase 8 — Unity Integration
+
+| Component | Status |
+|---|---|
+| Native plugin loading | Working — `tts_plugin.dll` + `onnxruntime.dll` loaded via Unity's `Plugins/x86_64` convention |
+| C# ↔ C++ interop | Working — `DllImport` bindings correctly call `InitTTS`, `Synthesize`, `ShutdownTTS` |
+| Async, non-blocking call | Working — `Synthesize` runs via `Task.Run`, off Unity's main thread |
+| Model loading at runtime | Working — via `Application.streamingAssetsPath` |
+| Audio playback | Working — synthesized samples converted to an `AudioClip` and played through an `AudioSource` |
+| End-to-end demo | Working — button click in Unity triggers real TTS inference and audible speech |
+
+**Debugging notes worth keeping for the write-up**:
+1. **Silent exception swallowing hid the real error.** The original `catch (...) { return false; }` gave no diagnostic info at all — adding proper exception logging (`catch (const std::exception& e)`, writing `e.what()` to a log file) was what actually surfaced the fix. A good example of why silently swallowing exceptions in native code is a real anti-pattern, not just a style nitpick.
+2. **Root cause was a one-character typo**: `StremingAssets` instead of `StreamingAssets` — Unity treats "StreamingAssets" as a reserved folder name and silently fails to recognize anything else, with no warning at all. A small, human mistake, but a good illustration of how a single typo in engine-reserved naming can produce a completely opaque failure three layers removed (Unity → C# → C++) from where the actual mistake was made.
+3. Also fixed along the way: Unity's native plugin folder needed the exact name `x86_64` (was initially `Windows_86_64`), and P/Invoke string marshaling needed `CharSet = CharSet.Unicode` to correctly pass a wide-character path to the C++ `wchar_t*` parameter — a common, easy-to-miss P/Invoke gotcha.
+
+
+## LLM ↔ Unity Integration — Partial
+
+The LLM C++ wrapper (llama.cpp native API) is validated standalone — generates coherent text through the compressed GGUF model. Integrating it into the Unity editor process hit a dynamic-library loading issue: llama.cpp discovers its compute-backend DLLs (`ggml-cpu-*`) at runtime via executable/working-directory search, which doesn't resolve correctly inside Unity's process. The TTS half of the pipeline is fully integrated and working in Unity; the LLM half is proven in C++ but not yet bridged into the engine. Resolving this would likely mean statically linking the ggml backends or a custom backend-registration path — a known, bounded next step, not an open question.
+
+
+## LLM ↔ Unity Integration — Working (Subprocess Architecture)
+
+| Component | Status |
+|---|---|
+| In-process approach (`llm_plugin.dll` via `DllImport`) | Failed — `llama_model_load_from_file` returned null inside Unity's process |
+| Subprocess approach (`llm_cli.exe` spawned via `System.Diagnostics.Process`) | Working — generates real text from the pruned+distilled+quantized model |
+| Phonemization bridge (`phonemize_bridge.py`, stdin-based) | Working |
+| TTS synthesis (existing native plugin) | Working |
+| End-to-end demo | Working — button click triggers live LLM generation → phonemization → speech, fully inside Unity |
+
+**Root cause of the in-process failure**: llama.cpp's `ggml_backend_load_all()` discovers compute-backend DLLs (`ggml-cpu-*.dll`) by scanning the directory of the *main executable* — `Unity.exe` inside the Editor, nowhere near the plugin DLLs — so no compute backend ever registered and model loading silently returned null. Rather than statically relinking llama.cpp (a heavier undertaking), the fix was architectural: run `llm_cli.exe` as a genuine subprocess from its own known-good directory (the same pattern already used for the Python phonemizer), sidestepping backend discovery entirely instead of solving it in-process.
+
+**Debugging notes worth keeping for the write-up**:
+1. **A missing `libomp.dll` masked itself as an unrelated Windows API-set error.** Copying the exe and model DLLs into a second folder (`StreamingAssets`, for an earlier attempt) without the OpenMP runtime produced `api-ms-win-crt-string-l1-1-0.dll: cannot open shared object file` — a generic-looking CRT error unrelated to the actual missing dependency. Diffing directory contents byte-for-byte between the working and failing locations surfaced it.
+2. **Classic stdout/stderr pipe deadlock.** `llama.cpp` writes tens of KB of model-loading diagnostics to stderr; the original C# code called `StandardOutput.ReadToEnd()` before touching stderr, so once the OS pipe buffer for stderr filled, the child blocked writing to it while C# blocked waiting on stdout — neither side could proceed. Fixed by reading both streams concurrently via `ReadToEndAsync()` before `WaitForExit()`. Several `llm_cli.exe` processes were left hung in the background before this was caught.
+3. **Command-line argument quoting broke on the model's own output.** Passing LLM-generated text (which naturally contains embedded quotes, e.g. `Say: "Hello..."`) as a quoted command-line argument to `phonemize_bridge.py` corrupted the argument boundary. Fixed by switching the bridge to read from stdin instead of `sys.argv` — a more robust pattern for passing arbitrary generated text between processes in general.
+4. **A relative model path silently failed under a different working directory.** `phonemize_bridge.py` loads `en_US-lessac-medium.onnx` by relative path, which only resolves when the process's working directory is `C:\VirtualCharEngine`. The subprocess launch never set `WorkingDirectory`, so Python threw and produced empty output — surfacing several layers away in C# as a `FormatException`. This was the first time this code path had actually executed, since every earlier attempt died upstream at the (now-fixed) in-process LLM init.
+
+## LLM ↔ Unity Integration — Measured End-to-End Latency (CPU, subprocess architecture)
+
+| Run | LLM generation | Phonemization | TTS synthesis | Total |
+|---|---|---|---|---|
+| 1 | 4408 ms | 2804 ms | 434 ms | 7647 ms |
+| 2 | 3518 ms | 3066 ms | 345 ms | 6931 ms |
+| 3 | 2900 ms | 3643 ms | 298 ms | 6842 ms |
+| **avg** | **~3609 ms** | **~3171 ms** | **~359 ms** | **~7140 ms** |
+
+**Honest caveat**: this measures cold, per-call subprocess overhead, not steady-state inference — both `llm_cli.exe` and `phonemize_bridge.py` reload their models from disk on every single call instead of staying resident. Phonemization (pure Python interpreter and Piper voice reload) costs roughly as much wall-clock time as LLM generation itself — the bottleneck here is process startup, not model compute. A persistent-process or properly-fixed in-process architecture would cut this dramatically; that's the clear next optimization, not pursued further here given scope.
